@@ -6,7 +6,7 @@ RUN go build -o mailcopy
 
 FROM alpine
 RUN apk add --no-cache ca-certificates
-COPY --from=build /app /usr/local/bin/
+COPY --from=build /app/mailcopy /usr/local/bin/
 RUN mkdir -p /etc/mailcopy
 ENV CONFIG_FILE=/etc/mailcopy/config.json
 CMD ["/usr/local/bin/mailcopy"]
