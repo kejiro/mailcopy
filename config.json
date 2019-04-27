@@ -1,0 +1,21 @@
+{
+  "from": {
+    "server": "",
+    "username": "",
+    "password": ""
+  },
+  "to": {
+    "server": "",
+    "username": "",
+    "password": ""
+  },
+  "mapping": {
+    "Archived": "Archive",
+    "Sent Messages": "Sent Items",
+    "Sent": "Sent Items",
+    "Junk": "Junk Email",
+    "Trash": "Deleted Items",
+    "Deleted Messages": "Deleted Items"
+  },
+  "exclude": []
+}
