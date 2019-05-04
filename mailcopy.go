@@ -56,8 +56,9 @@ func copyMailbox(from *client.Client, to *client.Client, source, dest string) er
 	}
 
 	total := mbox.Messages
+	left := total
 	// TODO: Possible issue when messages is above int limit
-	bar := uiprogress.AddBar(int(mbox.Messages)).AppendCompleted().PrependElapsed()
+	bar := uiprogress.AddBar(int(total)).AppendCompleted().PrependElapsed()
 	bar.PrependFunc(func(b *uiprogress.Bar) string {
 		return strutil.Resize(fmt.Sprintf("%s: %d/%d", source, b.Current(), total), 22)
 	})
@@ -65,14 +66,17 @@ func copyMailbox(from *client.Client, to *client.Client, source, dest string) er
 	if err := to.Create(dest); err != nil && err.Error() != "Mailbox already exists." {
 		return err
 	}
-	for mbox.Messages > 0 {
-		end := mbox.Messages
-		if end > 10 {
-			end = 10
+	for left > 0 {
+		seqStart := left - 10
+		if seqStart < 1 {
+			seqStart = 1
+		}
+		if seqStart > left {
+			seqStart = left
 		}
 
 		seqset := new(imap.SeqSet)
-		seqset.AddRange(1, end)
+		seqset.AddRange(seqStart, left)
 
 		section := &imap.BodySectionName{}
 		items := []imap.FetchItem{section.FetchItem(), imap.FetchFlags, imap.FetchInternalDate, imap.FetchRFC822Size, imap.FetchEnvelope}
@@ -80,8 +84,14 @@ func copyMailbox(from *client.Client, to *client.Client, source, dest string) er
 		messages := make(chan *imap.Message, 10)
 		done := make(chan error, 1)
 		go func(messages chan *imap.Message, done chan error) {
-			done <- from.Fetch(seqset, items, messages)
+			if err := from.Fetch(seqset, items, messages); err != nil {
+				log.Printf("error occurred while fetching messages: %s", err)
+				done <- err
+			}
+			close(done)
 		}(messages, done)
+
+		msgs := make([]uint32, 0)
 
 	outer:
 		for {
@@ -93,9 +103,12 @@ func copyMailbox(from *client.Client, to *client.Client, source, dest string) er
 				break outer
 			case msg, ok := <-messages:
 				if !ok {
-					return fmt.Errorf("something went wrong, messages closed early")
+					// Channel closed, all mails received
+					break outer
 				}
 				bar.Incr()
+
+				msgs = append(msgs, msg.SeqNum)
 				r := msg.GetBody(section)
 				if err := to.Append(dest, msg.Flags, msg.InternalDate, r); err != nil {
 					return err
@@ -104,14 +117,15 @@ func copyMailbox(from *client.Client, to *client.Client, source, dest string) er
 		}
 		item := imap.FormatFlagsOp(imap.AddFlags, true)
 		flags := []interface{}{imap.DeletedFlag}
-		if err := from.Store(seqset, item, flags, nil); err != nil {
+		del := new(imap.SeqSet)
+		del.AddNum(msgs...)
+		if err := from.Store(del, item, flags, nil); err != nil {
 			log.Fatal(err)
 		}
 		if err := from.Expunge(nil); err != nil {
 			log.Printf("failed to expunge messages: %s\n", err)
 		}
-
-		mbox, err = from.Select(source, false)
+		left = left - 10
 	}
 	return nil
 }
