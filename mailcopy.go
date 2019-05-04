@@ -3,12 +3,22 @@ package main
 import (
 	"crypto/tls"
 	"encoding/json"
+	"flag"
+	"fmt"
 	"io/ioutil"
 	"log"
 	"os"
+	"path"
+	"sort"
 
 	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/client"
+	"github.com/gosuri/uiprogress"
+	"github.com/gosuri/uiprogress/util/strutil"
+)
+
+var (
+	listOnly bool
 )
 
 type (
@@ -23,6 +33,7 @@ type (
 		To      serverConfig      `json:"to,omitempty"`
 		Mapping map[string]string `json:"mapping,omitempty"`
 		Exclude []string          `json:"exclude,omitempty"`
+		Include []string          `json:"include,omitempty"`
 	}
 )
 
@@ -44,39 +55,75 @@ func copyMailbox(from *client.Client, to *client.Client, source, dest string) er
 		return nil
 	}
 
+	total := mbox.Messages
+	// TODO: Possible issue when messages is above int limit
+	bar := uiprogress.AddBar(int(mbox.Messages)).AppendCompleted().PrependElapsed()
+	bar.PrependFunc(func(b *uiprogress.Bar) string {
+		return strutil.Resize(fmt.Sprintf("%s: %d/%d", source, b.Current(), total), 22)
+	})
+
 	if err := to.Create(dest); err != nil && err.Error() != "Mailbox already exists." {
 		return err
 	}
-
-	log.Printf("Copying %d messages", mbox.Messages)
-
-	seqset := new(imap.SeqSet)
-	seqset.AddRange(1, mbox.Messages)
-
-	section := &imap.BodySectionName{}
-	items := []imap.FetchItem{section.FetchItem(), imap.FetchFlags, imap.FetchInternalDate, imap.FetchRFC822Size, imap.FetchEnvelope}
-
-	messages := make(chan *imap.Message, 10)
-	done := make(chan error, 1)
-	go func(messages chan *imap.Message, done chan error) {
-		done <- from.Fetch(seqset, items, messages)
-	}(messages, done)
-
-	for msg := range messages {
-		r := msg.GetBody(section)
-		if err := to.Append(dest, msg.Flags, msg.InternalDate, r); err != nil {
-			return err
+	for mbox.Messages > 0 {
+		end := mbox.Messages
+		if end > 10 {
+			end = 10
 		}
-	}
 
-	if err := <-done; err != nil {
-		return err
+		seqset := new(imap.SeqSet)
+		seqset.AddRange(1, end)
+
+		section := &imap.BodySectionName{}
+		items := []imap.FetchItem{section.FetchItem(), imap.FetchFlags, imap.FetchInternalDate, imap.FetchRFC822Size, imap.FetchEnvelope}
+
+		messages := make(chan *imap.Message, 10)
+		done := make(chan error, 1)
+		go func(messages chan *imap.Message, done chan error) {
+			done <- from.Fetch(seqset, items, messages)
+		}(messages, done)
+
+	outer:
+		for {
+			select {
+			case err := <-done:
+				if err != nil {
+					return err
+				}
+				break outer
+			case msg, ok := <-messages:
+				if !ok {
+					return fmt.Errorf("something went wrong, messages closed early")
+				}
+				bar.Incr()
+				r := msg.GetBody(section)
+				if err := to.Append(dest, msg.Flags, msg.InternalDate, r); err != nil {
+					return err
+				}
+			}
+		}
+		item := imap.FormatFlagsOp(imap.AddFlags, true)
+		flags := []interface{}{imap.DeletedFlag}
+		if err := from.Store(seqset, item, flags, nil); err != nil {
+			log.Fatal(err)
+		}
+		if err := from.Expunge(nil); err != nil {
+			log.Printf("failed to expunge messages: %s\n", err)
+		}
+
+		mbox, err = from.Select(source, false)
 	}
 	return nil
 }
 
 func main() {
+	flag.Parse()
+
 	configFilename := os.Getenv("CONFIG_FILE")
+	if configFilename == "" {
+		wd, _ := os.Getwd()
+		configFilename = path.Join(wd, "config.json")
+	}
 	configFile, err := ioutil.ReadFile(configFilename)
 	if err != nil {
 		log.Fatal(err)
@@ -93,6 +140,18 @@ func main() {
 	}
 	defer from.Close()
 
+	if listOnly {
+		mboxSrv := make(chan *imap.MailboxInfo, 10)
+		done := make(chan error, 1)
+		go func() {
+			done <- from.List("", "*", mboxSrv)
+		}()
+		for m := range mboxSrv {
+			fmt.Println(m.Name)
+		}
+		return
+	}
+
 	to, err := createClient(cfg.To)
 	if err != nil {
 		log.Fatal(err)
@@ -100,19 +159,30 @@ func main() {
 	defer to.Close()
 
 	mailboxes := make(map[string]string)
-	mboxSrv := make(chan *imap.MailboxInfo, 10)
-	done := make(chan error, 1)
-	go func() {
-		done <- from.List("", "*", mboxSrv)
-	}()
-	for m := range mboxSrv {
-		mailboxes[m.Name] = m.Name
-		if override, ok := cfg.Mapping[m.Name]; ok {
-			mailboxes[m.Name] = override
+
+	if len(cfg.Include) != 0 {
+		for _, m := range cfg.Include {
+			mailboxes[m] = m
+		}
+	} else {
+		mboxSrv := make(chan *imap.MailboxInfo, 10)
+		done := make(chan error, 1)
+		go func() {
+			done <- from.List("", "*", mboxSrv)
+		}()
+		for m := range mboxSrv {
+			mailboxes[m.Name] = m.Name
+		}
+		if err := <-done; err != nil {
+			log.Fatal(err)
 		}
 	}
-	if err := <-done; err != nil {
-		log.Fatal(err)
+
+	for k, v := range cfg.Mapping {
+		_, ok := mailboxes[k]
+		if ok {
+			mailboxes[k] = v
+		}
 	}
 
 	if len(cfg.Exclude) != 0 {
@@ -121,16 +191,28 @@ func main() {
 		}
 	}
 
+	boxesToCopy := make([]string, len(mailboxes))
+	idx := 0
+	for k := range mailboxes {
+		boxesToCopy[idx] = k
+		idx++
+	}
+	sort.Strings(boxesToCopy)
+
 	log.Println("Copying mailboxes:")
-	for k, v := range mailboxes {
-		log.Printf("%s -> %s\n", k, v)
+	for _, f := range boxesToCopy {
+		t := mailboxes[f]
+		log.Printf("%s -> %s\n", f, t)
 	}
 
-	for k, v := range mailboxes {
-		log.Printf("Processing %s ... ", k)
-		if err := copyMailbox(from, to, k, v); err != nil {
+	uiprogress.Start()
+	for _, f := range boxesToCopy {
+		if err := copyMailbox(from, to, f, mailboxes[f]); err != nil {
 			log.Fatal(err)
 		}
-		log.Printf("Processing %s done ", k)
 	}
+}
+
+func init() {
+	flag.BoolVar(&listOnly, "list", false, "List available mailboxes and then exit")
 }
