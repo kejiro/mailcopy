@@ -17,5 +17,6 @@
     "Trash": "Deleted Items",
     "Deleted Messages": "Deleted Items"
   },
-  "exclude": []
+  "exclude": [],
+  "include": []
 }
